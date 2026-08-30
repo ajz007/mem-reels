@@ -1,0 +1,9 @@
+{
+  "name": "Memory Reels — local prototype",
+  "short_name": "Memory Reels",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fff8f2",
+  "theme_color": "#35192b",
+  "description": "A local fixture-only prototype for Memory Reels."
+}
