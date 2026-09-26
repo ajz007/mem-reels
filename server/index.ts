@@ -3,10 +3,16 @@ import "dotenv/config";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 import { AuthService, readCookie, type AuthMode } from "./auth";
-import { liveTemplates } from "./catalogue";
+import { createAnalyticsEvent, LocalDevelopmentAnalyticsAdapter } from "./analytics";
+import { templateDetailForFlags, templatesForFlags } from "./catalogue";
 import { FalAdapter } from "./fal-adapter";
+import { FalWebhookVerifier, parseFalWebhook } from "./fal-webhook";
+import { loadFeatureFlags } from "./feature-flags";
 import { LocalJobService } from "./jobs";
+import { recipeForTemplate } from "./template-recipes";
 import { InputValidationError } from "./validation";
+import { assertJsonStoreIsSafeForRuntime, falWebhookUrl } from "./runtime-safety";
+import { parseCapturedPaymentEvent, verifyRazorpayWebhook } from "./razorpay";
 
 const port = Number(process.env.API_PORT ?? "8787");
 const mode: AuthMode = process.env.AUTH_MODE === "google" ? "google" : "local";
@@ -21,7 +27,12 @@ const auth = new AuthService(
     : undefined,
 );
 const fal = new FalAdapter();
-const jobs = new LocalJobService(fal);
+assertJsonStoreIsSafeForRuntime(fal.configuration.submissionEnabled);
+falWebhookUrl();
+const flags = loadFeatureFlags();
+const analytics = new LocalDevelopmentAnalyticsAdapter();
+const jobs = new LocalJobService(fal, analytics);
+const falWebhookVerifier = new FalWebhookVerifier();
 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
@@ -45,6 +56,52 @@ server.listen(port, "127.0.0.1", () => {
 await jobs.initialize();
 
 async function route(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+  if (request.method === "POST" && url.pathname === "/api/provider-webhooks/razorpay") {
+    const rawBody = await readRawBody(request);
+    const signature = header(request, "x-razorpay-signature");
+    const eventId = header(request, "x-razorpay-event-id");
+    if (!verifyRazorpayWebhook(rawBody, signature))
+      return sendJson(response, 401, {
+        error: { code: "invalid_webhook", message: "Webhook verification failed." },
+      });
+    const event = parseCapturedPaymentEvent(rawBody, eventId);
+    if (!event)
+      return sendJson(response, 400, {
+        error: { code: "invalid_webhook", message: "Webhook payload is invalid." },
+      });
+    await jobs.applyCapturedPayment(event);
+    response.writeHead(204).end();
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/provider-webhooks/fal") {
+    const rawBody = await readRawBody(request);
+    const headers = {
+      requestId: header(request, "x-fal-webhook-request-id"),
+      userId: header(request, "x-fal-webhook-user-id"),
+      timestamp: header(request, "x-fal-webhook-timestamp"),
+      signature: header(request, "x-fal-webhook-signature"),
+    };
+    if (Object.values(headers).some((value) => !value))
+      return sendJson(response, 400, {
+        error: { code: "invalid_webhook", message: "Missing webhook headers." },
+      });
+    if (!(await falWebhookVerifier.verify(headers, rawBody)))
+      return sendJson(response, 401, {
+        error: { code: "invalid_webhook", message: "Webhook verification failed." },
+      });
+    const result = parseFalWebhook(rawBody);
+    if (!result)
+      return sendJson(response, 400, {
+        error: { code: "invalid_webhook", message: "Webhook payload is invalid." },
+      });
+    if (result.requestId !== headers.requestId)
+      return sendJson(response, 400, {
+        error: { code: "invalid_webhook", message: "Webhook request IDs do not match." },
+      });
+    await jobs.handleProviderCompletion(result);
+    response.writeHead(204).end();
+    return;
+  }
   const sessionId = readCookie(request.headers.cookie, "memory_reels_session");
   if (request.method === "GET" && url.pathname === "/api/auth/me") {
     sendJson(response, 200, { user: auth.currentUser(sessionId) });
@@ -97,12 +154,119 @@ async function route(request: IncomingMessage, response: ServerResponse, url: UR
       return sendJson(response, 404, {
         error: { code: "not_found", message: "Route not found." },
       });
+    assertJsonStoreIsSafeForRuntime(true);
     fal.enableLocalTestSubmission();
     sendJson(response, 200, { enabled: true });
     return;
   }
+  if (request.method === "POST" && url.pathname === "/api/analytics/events") {
+    const body = await readJsonBody(request);
+    assertAllowedAnalyticsInput(body);
+    const template = templatesForFlags(flags).find(
+      (candidate) => candidate.id === body.templateId && candidate.version === body.templateVersion,
+    );
+    if (!template)
+      return sendJson(response, 400, {
+        error: { code: "invalid_template", message: "Choose a live template." },
+      });
+    const user = auth.currentUser(sessionId);
+    if (body.name === "reel_shared") {
+      if (!user || typeof body.jobId !== "string")
+        return sendJson(response, 401, {
+          error: { code: "authentication_required", message: "Sign in before sharing." },
+        });
+      jobs.get(user, body.jobId);
+    }
+    await analytics.record(
+      createAnalyticsEvent({
+        name: body.name,
+        user,
+        anonymousSessionReference: body.anonymousSessionReference,
+        template,
+        ...(typeof body.jobId === "string" ? { jobId: body.jobId } : {}),
+        resultStatus: body.resultStatus,
+        reasonCode: body.reasonCode,
+      }),
+    );
+    response.writeHead(204).end();
+    return;
+  }
   if (request.method === "GET" && url.pathname === "/api/templates") {
-    sendJson(response, 200, { templates: liveTemplates });
+    sendJson(response, 200, { templates: templatesForFlags(flags) });
+    return;
+  }
+  const templateMatch = url.pathname.match(/^\/api\/templates\/([^/]+)$/);
+  if (request.method === "GET" && templateMatch) {
+    const template = templateDetailForFlags(decodeURIComponent(templateMatch[1]), flags);
+    if (!template)
+      return sendJson(response, 404, {
+        error: { code: "template_unavailable", message: "This template is unavailable." },
+      });
+    sendJson(response, 200, { template });
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/product-config") {
+    sendJson(response, 200, {
+      features: {
+        experimentalTemplatesEnabled: flags.experimentalTemplatesEnabled,
+        validationMode: flags.validationMode,
+      },
+    });
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/account") {
+    const user = auth.currentUser(sessionId);
+    if (!user)
+      return sendJson(response, 401, {
+        error: { code: "authentication_required", message: "Sign in to view credits." },
+      });
+    sendJson(response, 200, { account: jobs.account(user) });
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/checkout-sessions") {
+    const user = auth.currentUser(sessionId);
+    if (!user)
+      return sendJson(response, 401, {
+        error: { code: "authentication_required", message: "Sign in before purchasing credits." },
+      });
+    const body = await readJsonBody(request);
+    const packId = typeof body.packId === "string" ? body.packId : "";
+    sendJson(response, 201, { checkout: await jobs.createCheckout(user, packId) });
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/verify-payment") {
+    const user = auth.currentUser(sessionId);
+    if (!user)
+      return sendJson(response, 401, {
+        error: { code: "authentication_required", message: "Sign in before verifying payment." },
+      });
+    const body = await readJsonBody(request);
+    const fields = ["purchaseId", "razorpay_payment_id", "razorpay_order_id", "razorpay_signature"];
+    if (fields.some((field) => typeof body[field] !== "string" || !body[field]))
+      return sendJson(response, 400, {
+        error: { code: "invalid_payment", message: "Missing payment verification fields." },
+      });
+    const result = jobs.verifyCheckoutPayment(
+      user,
+      body.purchaseId as string,
+      body.razorpay_payment_id as string,
+      body.razorpay_order_id as string,
+      body.razorpay_signature as string,
+    );
+    if (!result.verified)
+      return sendJson(response, 400, {
+        error: { code: "invalid_payment", message: "Payment signature verification failed." },
+      });
+    sendJson(response, 200, result);
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/reels") {
+    const user = auth.currentUser(sessionId);
+    if (!user)
+      return sendJson(response, 401, {
+        error: { code: "authentication_required", message: "Sign in to view your reels." },
+      });
+    sendJson(response, 200, { jobs: jobs.list(user) });
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/storage/health") {
@@ -131,11 +295,12 @@ async function route(request: IncomingMessage, response: ServerResponse, url: UR
     const body = await readJsonBody(request);
     const templateId = typeof body.templateId === "string" ? body.templateId : "";
     const permissionConfirmed = body.permissionConfirmed === true;
-    if (!liveTemplates.some((template) => template.id === templateId))
+    const template = templateDetailForFlags(templateId, flags);
+    if (!template)
       return sendJson(response, 400, {
         error: { code: "invalid_template", message: "Choose a live template." },
       });
-    const job = await jobs.createDraft(user, templateId, permissionConfirmed);
+    const job = await jobs.createDraft(user, template.id, template.version, permissionConfirmed);
     sendJson(response, 201, { job });
     return;
   }
@@ -177,6 +342,16 @@ async function route(request: IncomingMessage, response: ServerResponse, url: UR
     });
     return;
   }
+  const liveRetryMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/live-retry$/);
+  if (request.method === "POST" && liveRetryMatch) {
+    const user = auth.currentUser(sessionId);
+    if (!user)
+      return sendJson(response, 401, {
+        error: { code: "authentication_required", message: "Sign in before retrying." },
+      });
+    sendJson(response, 202, { job: await jobs.retryLive(user, liveRetryMatch[1]) });
+    return;
+  }
   const deliveryMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/delivery$/);
   if (request.method === "GET" && deliveryMatch) {
     const user = auth.currentUser(sessionId);
@@ -185,6 +360,39 @@ async function route(request: IncomingMessage, response: ServerResponse, url: UR
         error: { code: "authentication_required", message: "Sign in before downloading." },
       });
     const delivery = await jobs.delivery(user, deliveryMatch[1]);
+    if (url.searchParams.get("download") === "1") {
+      const job = jobs.get(user, deliveryMatch[1]);
+      const template = templatesForFlags(flags).find(
+        (candidate) => candidate.id === job.templateId,
+      );
+      if (template) {
+        try {
+          await analytics.record(
+            createAnalyticsEvent({
+              name: "reel_downloaded",
+              user,
+              template,
+              jobId: job.id,
+              resultStatus: "succeeded",
+              reasonCode: "download_requested",
+              providerCostCeilingUsd:
+                job.attempt?.provider === "fal.ai"
+                  ? (recipeForTemplate(job.templateId, job.templateVersion)
+                      ?.providerCostCeilingUsd ?? 0)
+                  : 0,
+              generationOutcome:
+                job.attempt?.provider === "fal.ai" ? "provider_succeeded" : "fixture_succeeded",
+              creditOutcome: job.attempt?.provider === "fal.ai" ? "consumed" : "not_reserved",
+            }),
+          );
+        } catch (error) {
+          console.warn(
+            "Download analytics was not recorded.",
+            error instanceof Error ? error.message : "unknown",
+          );
+        }
+      }
+    }
     const extension = delivery.contentType === "video/mp4" ? "mp4" : "txt";
     const disposition = url.searchParams.get("download") === "1" ? "attachment" : "inline";
     response
@@ -227,6 +435,11 @@ async function route(request: IncomingMessage, response: ServerResponse, url: UR
   sendJson(response, 404, { error: { code: "not_found", message: "Route not found." } });
 }
 
+function header(request: IncomingMessage, name: string): string {
+  const value = request.headers[name];
+  return typeof value === "string" ? value : "";
+}
+
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
@@ -248,6 +461,49 @@ function requireEnvironment(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`${name} is required when AUTH_MODE=google.`);
   return value;
+}
+
+function assertAllowedAnalyticsInput(body: Record<string, unknown>): asserts body is {
+  name: "template_catalogue_viewed" | "template_selected" | "reel_shared";
+  templateId: string;
+  templateVersion: number;
+  anonymousSessionReference: string;
+  jobId?: string;
+  resultStatus: "succeeded" | "failed" | "cancelled";
+  reasonCode:
+    "catalogue_opened" | "template_chosen" | "share_completed" | "share_cancelled" | "share_failed";
+} {
+  const allowedKeys = new Set([
+    "name",
+    "templateId",
+    "templateVersion",
+    "anonymousSessionReference",
+    "jobId",
+    "resultStatus",
+    "reasonCode",
+  ]);
+  if (Object.keys(body).some((key) => !allowedKeys.has(key)))
+    throw new InputValidationError(
+      "unsupported_file",
+      "Analytics payload contains an unsupported property.",
+    );
+  if (
+    !["template_catalogue_viewed", "template_selected", "reel_shared"].includes(
+      String(body.name),
+    ) ||
+    typeof body.templateId !== "string" ||
+    !Number.isSafeInteger(body.templateVersion) ||
+    typeof body.anonymousSessionReference !== "string" ||
+    !["succeeded", "failed", "cancelled"].includes(String(body.resultStatus)) ||
+    ![
+      "catalogue_opened",
+      "template_chosen",
+      "share_completed",
+      "share_cancelled",
+      "share_failed",
+    ].includes(String(body.reasonCode))
+  )
+    throw new InputValidationError("unsupported_file", "Analytics payload is invalid.");
 }
 
 async function readRawBody(request: IncomingMessage): Promise<Buffer> {

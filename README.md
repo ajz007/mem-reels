@@ -29,3 +29,13 @@ Open `http://127.0.0.1:5173`. The demo flow is:
 The local API loads server-only configuration from `apps/web/.env`. For a live run, configure `FAL_KEY`, `AWS_REGION`, and `MEMORY_REELS_S3_BUCKET`. Keep `FAL_LIVE_SUBMISSION_ENABLED=false` while reviewing a proposal; setting it to `true` allows the separately confirmed UI action to submit one paid request. Never prefix secrets with `VITE_`.
 
 The application uses typed contracts in `src/domain/ports.ts`. Google OAuth uses state and PKCE, but its in-memory session store remains local-development-only.
+
+Phase 0 product measurement uses a local, privacy-safe event adapter with no external analytics dependency. See [the event catalogue and funnel definitions](docs/product-analytics.md).
+
+Template summaries, detail metadata, lifecycle rules, and server-private generation recipes are documented in [the versioned catalogue guide](docs/template-catalogue.md).
+
+Template-specific compatibility outcomes, deterministic safeguards, provider boundaries, and the no-credit invariant are documented in [the photo validation guide](docs/photo-compatibility-validation.md).
+
+Provider-neutral requests, adapter routing, idempotency, retries, webhook verification, and deferred production persistence requirements are documented in [the generation reliability guide](docs/generation-routing-reliability.md).
+
+Razorpay one-time checkout, append-only credit entitlement, purchase history, and the owner-only My Reels library are documented in [the Phase 4 guide](docs/phase-4-credits-payments-library.md). Tests and fixtures do not execute live payments or paid generation.

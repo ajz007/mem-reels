@@ -3,7 +3,7 @@
   "short_name": "Memory Reels",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#fff8f2",
-  "theme_color": "#35192b",
-  "description": "A local fixture-only prototype for Memory Reels."
+  "background_color": "#fbf6f2",
+  "theme_color": "#953d5d",
+  "description": "Create a private, five-second vertical reel from one treasured portrait."
 }

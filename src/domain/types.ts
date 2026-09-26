@@ -17,6 +17,8 @@ export const jobStatuses = [
 
 export type JobStatus = (typeof jobStatuses)[number];
 
+import type { CompatibilityValidationResult } from "./validation";
+
 export type SafeErrorCode =
   "invalid_image_source" | "unsupported_file" | "unsupported_photo" | "technical_failure";
 
@@ -26,17 +28,55 @@ export interface SafeError {
   nextStep: string;
 }
 
-export interface Template {
+export type TemplateStatus = "draft" | "experimental" | "active" | "retired";
+
+export interface TemplatePoster {
+  url: string;
+  alt: string;
+}
+
+export interface TemplateSampleVideo {
+  url?: string;
+  posterUrl: string;
+  alt: string;
+  label: string;
+  availability: "available" | "preview_pending";
+}
+
+export interface TemplateOutputFormat {
+  durationSeconds: number;
+  aspectRatio: "9:16";
+  resolution: { width: number; height: number; label: string };
+}
+
+export interface TemplateSummary {
   id: string;
   version: number;
   title: string;
   description: string;
-  durationSeconds: 5;
-  aspectRatio: "9:16";
-  slotCount: 1 | 2;
-  creditCost: 1;
-  eligibilityRules: readonly string[];
-  unsupportedRules: readonly string[];
+  category: string;
+  tags: readonly string[];
+  collection: string;
+  poster: TemplatePoster;
+  sampleVideo: TemplateSampleVideo;
+  requiredInputCount: number;
+  output: TemplateOutputFormat;
+  creditPrice: number;
+  costDescription: string;
+  status: TemplateStatus;
+  generationAvailability: "paid_approved" | "fixture_only";
+}
+
+export interface TemplateDetail extends TemplateSummary {
+  exampleSource: TemplatePoster;
+  inputGuidance: {
+    title: string;
+    description: string;
+    requirements: readonly string[];
+  };
+  eligibilityConditions: readonly string[];
+  unsupportedConditions: readonly string[];
+  privacyDescription: string;
 }
 
 export interface Consent {
@@ -58,24 +98,36 @@ export interface GenerationAttempt {
     | "failed"
     | "fixture_completed"
     | "fixture_failed";
-  provider: "local-fixture" | "fal.ai";
+  provider: "local-fixture" | "fal.ai" | string;
   promptTemplateVersion: string;
   providerRequestId?: string;
   proposalId?: string;
+  idempotencyKey?: string;
+  retryOfAttemptId?: string;
+  retryable?: boolean;
+  failureReasonCode?:
+    | "provider_rejected"
+    | "provider_failed"
+    | "provider_timeout"
+    | "provider_unavailable"
+    | "payload_unavailable"
+    | "invalid_provider_output";
+  stateTransitions?: Array<{ status: GenerationAttempt["status"]; at: string }>;
 }
 
 export interface GenerationProposal {
   id: string;
-  model: "fal-ai/kling-video/v2.5-turbo/pro/image-to-video";
-  input: {
-    image_url: string;
-    prompt: string;
-    duration: "5";
-    negative_prompt: string;
-    cfg_scale: number;
-  };
-  expectedOutput: "5-second vertical MP4 based on the uploaded portrait";
-  estimatedMaximumCostUsd: 0.35;
+  templateId: string;
+  templateVersion: number;
+  recipeVersion: string;
+  expectedOutput: string;
+  durationSeconds: number;
+  aspectRatio: string;
+  resolution: { width: number; height: number; label: string };
+  audioMode: "none" | "generated_optional" | "generated_required";
+  creditCost: number;
+  estimatedMaximumCostUsd: number;
+  maximumApprovedPriceUsd: number;
   approvalRequired: true;
   providerConfigured: boolean;
   liveSubmissionEnabled: boolean;
@@ -86,17 +138,67 @@ export interface CreditLedgerEntry {
   id: string;
   userId: string;
   jobId?: string;
-  entryType: "grant" | "reserve" | "release" | "consume";
+  attemptId?: string;
+  purchaseId?: string;
+  entryType: "purchase" | "grant" | "reserve" | "release" | "consume" | "administrative_adjustment";
   credits: number;
   createdAt: string;
+}
+
+export type PurchaseStatus =
+  "checkout_created" | "payment_pending" | "paid" | "failed" | "refunded";
+
+export interface CreditPack {
+  id: string;
+  name: string;
+  credits: number;
+  amountPaise: number;
+  currency: "INR";
+  description: string;
+}
+
+export interface CreditPurchase {
+  id: string;
+  userId: string;
+  provider: "razorpay";
+  packId: string;
+  credits: number;
+  amountPaise: number;
+  currency: "INR";
+  status: PurchaseStatus;
+  providerOrderId?: string;
+  providerPaymentId?: string;
+  receiptReference: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CheckoutSession {
+  purchaseId: string;
+  provider: "razorpay";
+  providerOrderId: string;
+  publicKeyId: string;
+  amountPaise: number;
+  currency: "INR";
+  credits: number;
+  productName: string;
+}
+
+export interface AccountSummary {
+  balance: number;
+  packs: CreditPack[];
+  purchases: CreditPurchase[];
 }
 
 export interface Job {
   id: string;
   userId: string;
   templateId: string;
+  templateVersion: number;
   status: JobStatus;
   consent: Consent;
+  validationPolicyVersion?: number;
+  validationResult?: CompatibilityValidationResult;
   error?: SafeError;
   attempt?: GenerationAttempt;
   outputLabel?: string;

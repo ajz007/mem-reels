@@ -1,4 +1,21 @@
 import type { GenerationAttempt, Job, SafeError, UserIdentity } from "./types";
+import type { AnalyticsEvent } from "./analytics";
+import type { VisionCompatibilityObservations, VisionCompatibilityRequest } from "./validation";
+
+export interface AnalyticsPort {
+  record(event: AnalyticsEvent): Promise<void>;
+}
+
+export interface VisionCompatibilityProvider {
+  readonly sendsImageToExternalProvider: boolean;
+  analyze(
+    request: VisionCompatibilityRequest,
+  ): Promise<
+    | { status: "completed"; observations: VisionCompatibilityObservations }
+    | { status: "unavailable" }
+    | { status: "malformed" }
+  >;
+}
 
 export interface AuthProvider {
   getCurrentUser(): Promise<UserIdentity | null>;
